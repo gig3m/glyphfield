@@ -107,6 +107,13 @@ grep -q "$CUSTOM_CMD" "$clone/Service.qml" ||
 omarchy plugin enable "$(basename "$clone")" >/dev/null 2>&1 || true
 omarchy plugin disable omarchy.idle >/dev/null 2>&1 || true
 say "$(basename "$clone") now launches $CUSTOM_CMD"
+# The idle service is keepLoaded: a running shell keeps the old instance until
+# it restarts, so without this the stock screensaver keeps coming up.
+if omarchy-restart-shell >/dev/null 2>&1; then
+  say "restarted the Omarchy shell so the clone takes over"
+else
+  say "note: run omarchy-restart-shell (or log out and in) to finish the switch"
+fi
 
 echo "Installing the post-update hook..."
 mkdir -p "$HOOK_DIR"

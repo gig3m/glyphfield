@@ -21,6 +21,9 @@ for c in "$PLUGIN_DIR"/*.idle; do
   echo "  (the clone is left at $c; delete it if you like)"
 done
 
+# The idle service is keepLoaded, so the swap back only lands on a restart.
+omarchy-restart-shell >/dev/null 2>&1 || echo "  run omarchy-restart-shell to finish restoring stock"
+
 echo "Removing the post-update hook..."
 rm -f "$HOME/.config/omarchy/hooks/post-update.d/glyphfield-resync-idle.hook"
 

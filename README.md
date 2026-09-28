@@ -80,7 +80,9 @@ installer therefore follows the pattern of
 - Uses `omarchy plugin clone omarchy.idle` to clone the idle service into your
   own `<user>.idle` plugin, swaps that one command for
   `glyphfield-launch-screensaver`, and enables the clone in place of the stock
-  service.
+  service. The idle service stays loaded across plugin reloads, so the
+  installer restarts the Omarchy shell (`omarchy-restart-shell`) for the switch
+  to take effect.
 - Installs `glyphfield-launch-screensaver`, which opens one terminal per monitor
   like Omarchy's launcher. It uses the same `org.omarchy.screensaver` window
   class, so the idle service still tracks the screensaver.
