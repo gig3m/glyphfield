@@ -60,8 +60,41 @@ override it.
 
 ```sh
 git clone https://github.com/gig3m/glyphfield
-ln -s "$PWD/glyphfield/glyphfield" ~/.local/bin/glyphfield
+cd glyphfield
+./install.sh              # Omarchy: installs glyphfield and makes it the screensaver (kaleido)
+./install.sh mirror       # same, with another style
+./install.sh --no-screensaver   # any system: just the glyphfield command
 ```
+
+Commands are symlinked into `~/.local/bin`, so a `git pull` updates them in
+place. `./uninstall.sh` puts everything back.
+
+### How the Omarchy screensaver hookup works
+
+Omarchy's idle service hardcodes `omarchy-launch-screensaver`. `shell.json` has
+no setting for it, and `/usr/share/omarchy/bin` comes before `~/.local/bin` on
+the path, so replacing that script in `~/.local/bin` has no effect. The
+installer therefore follows the pattern of
+[omarchy-matrix-screensaver](https://github.com/etyurkin/omarchy-matrix-screensaver):
+
+- Uses `omarchy plugin clone omarchy.idle` to clone the idle service into your
+  own `<user>.idle` plugin, swaps that one command for
+  `glyphfield-launch-screensaver`, and enables the clone in place of the stock
+  service.
+- Installs `glyphfield-launch-screensaver`, which opens one terminal per monitor
+  like Omarchy's launcher. It uses the same `org.omarchy.screensaver` window
+  class, so the idle service still tracks the screensaver.
+- Installs `glyphfield-screensaver`, which runs glyphfield with Omarchy's exit
+  rules: any key, or focus leaving the window, closes the screensaver on every
+  monitor.
+- Adds a post-update hook that re-copies Omarchy's idle service after each
+  update and re-applies the swap. Your clone keeps getting upstream fixes, and
+  if Omarchy ever changes how the screensaver starts, you get a notification
+  instead of the screensaver silently not appearing.
+
+The screensaver style lives in `~/.config/glyphfield/screensaver`. Its look is
+whatever you last saved from `glyphfield --tune`. Empty that file to go back
+to Omarchy's stock screensaver without uninstalling.
 
 ## License
 

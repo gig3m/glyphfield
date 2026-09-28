@@ -1,0 +1,89 @@
+#!/bin/bash
+#
+# Launch glyphfield as the Omarchy screensaver: one fullscreen terminal per
+# monitor, each running glyphfield-screensaver. The idle service calls this in
+# place of omarchy-launch-screensaver (see install.sh).
+#
+# The style comes from ~/.config/glyphfield/screensaver. If that file is
+# missing or empty, or glyphfield is not installed, this hands straight off to
+# the stock launcher, so emptying the file is how to get the stock art back.
+#
+# Mirrors omarchy-launch-screensaver: the same terminals, configs and window
+# class (org.omarchy.screensaver), which the idle service uses to track the
+# screensaver's windows.
+
+STYLE_FILE="$HOME/.config/glyphfield/screensaver"
+style=$(tr -d '[:space:]' <"$STYLE_FILE" 2>/dev/null)
+
+if [[ -z $style ]] || ! command -v glyphfield >/dev/null || ! command -v glyphfield-screensaver >/dev/null; then
+  exec omarchy-launch-screensaver "$@"
+fi
+
+# Exit early if a screensaver is already running
+pgrep -f '[o]rg.omarchy.screensaver' >/dev/null && exit 0
+
+# Honour Omarchy's screensaver toggle, but allow a forced start
+if omarchy-toggle-enabled screensaver-off && [[ $1 != "force" ]]; then
+  exit 1
+fi
+
+focused=$(omarchy-hyprland-monitor-focused)
+terminal=$(xdg-terminal-exec --print-id)
+
+case $terminal in
+*Alacritty* | *ghostty* | *foot* | *kitty*) ;;
+*)
+  omarchy-notification-send -g ✋ "Screensaver only runs in Alacritty, Foot, Ghostty, or Kitty"
+  exit 1
+  ;;
+esac
+
+hypr_focus_monitor() {
+  hyprctl dispatch "hl.dsp.focus({ monitor = \"$1\" })" >/dev/null 2>&1 || hyprctl dispatch focusmonitor "$1" >/dev/null
+}
+
+hypr_exec() {
+  local command
+  printf -v command '%q ' "$@"
+  hyprctl dispatch "hl.dsp.exec_cmd([[$command]])" >/dev/null 2>&1 || hyprctl dispatch exec -- bash -lc "$command" >/dev/null
+}
+
+SOCKET="$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock"
+
+# Listen for window events before spawning, so a fast terminal cannot map
+# before we are watching for it.
+exec {events}< <(socat -U - "UNIX-CONNECT:$SOCKET")
+
+# A new window maps on whichever monitor is focused when it appears, so wait
+# for each monitor's window before moving focus on.
+wait_for_screensaver_window() {
+  local line deadline=$((SECONDS + 5))
+  while ((SECONDS < deadline)) && IFS= read -r -t $((deadline - SECONDS)) -u "$events" line; do
+    [[ $line == openwindow\>\>*,org.omarchy.screensaver,* ]] && return 0
+  done
+}
+
+run=(glyphfield-screensaver "$style")
+
+for m in $(hyprctl monitors -j | jq -r '.[] | .name'); do
+  hypr_focus_monitor "$m"
+
+  case $terminal in
+  *Alacritty*)
+    hypr_exec alacritty --class=org.omarchy.screensaver --config-file "$OMARCHY_PATH/default/alacritty/screensaver.toml" -e "${run[@]}"
+    ;;
+  *ghostty*)
+    hypr_exec ghostty --class=org.omarchy.screensaver --config-file="$OMARCHY_PATH/default/ghostty/screensaver" --font-size=18 -e "${run[@]}"
+    ;;
+  *foot*)
+    hypr_exec foot --app-id=org.omarchy.screensaver --config="$OMARCHY_PATH/default/foot/screensaver.ini" -e "${run[@]}"
+    ;;
+  *kitty*)
+    hypr_exec kitty --class=org.omarchy.screensaver --override font_size=18 --override window_padding_width=0 -e "${run[@]}"
+    ;;
+  esac
+
+  wait_for_screensaver_window
+done
+
+hypr_focus_monitor "$focused"

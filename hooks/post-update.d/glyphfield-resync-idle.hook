@@ -1,0 +1,65 @@
+#!/bin/bash
+#
+# Keep glyphfield's clone of the Omarchy idle service in sync with the
+# packaged one.
+#
+# The clone (<user>.idle) exists only to swap one command: the idle service
+# hardcodes omarchy-launch-screensaver in Service.qml, shell.json has no
+# setting for it, and /usr/share/omarchy/bin outranks ~/.local/bin on PATH, so
+# cloning the plugin is the only supported way to launch something else.
+#
+# A clone stops receiving upstream fixes. After every Omarchy update this
+# re-copies the packaged plugin and re-applies the swap, so the clone can only
+# ever differ from stock by that one command. manifest.json is left alone:
+# it carries the clone's own id.
+
+set -euo pipefail
+
+STOCK_DIR="/usr/share/omarchy/shell/plugins/services/idle"
+STOCK_CMD="omarchy-launch-screensaver"
+CUSTOM_CMD="glyphfield-launch-screensaver"
+
+# The clone is named after whoever cloned it, so find it by its origin.
+CLONE_DIR=""
+for candidate in "$HOME"/.config/omarchy/plugins/*.idle; do
+  [[ -f $candidate/manifest.json ]] || continue
+  if grep -q '"clonedFrom": *"omarchy.idle"' "$candidate/manifest.json"; then
+    CLONE_DIR="$candidate"
+    break
+  fi
+done
+[[ -n $CLONE_DIR && -d $STOCK_DIR ]] || exit 0
+
+# Only manage a clone that glyphfield set up.
+grep -q "$CUSTOM_CMD" "$CLONE_DIR/Service.qml" 2>/dev/null || exit 0
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+resynced=()
+
+for src in "$STOCK_DIR"/*; do
+  file=$(basename "$src")
+  [[ -f $src && $file != manifest.json ]] || continue
+  if [[ $file == Service.qml ]]; then
+    sed "s/\b${STOCK_CMD}\b/${CUSTOM_CMD}/g" "$src" >"$tmp/$file"
+    # Never install a copy that no longer calls our launcher: if upstream
+    # changes how it starts the screensaver, say so instead.
+    if ! grep -q "$CUSTOM_CMD" "$tmp/$file"; then
+      omarchy-notification-send -u critical -g 󰅚 "glyphfield screensaver needs attention" \
+        "Omarchy's idle service changed shape; re-run glyphfield's install.sh." >/dev/null 2>&1 || true
+      exit 0
+    fi
+  else
+    cp "$src" "$tmp/$file"
+  fi
+  if ! cmp -s "$tmp/$file" "$CLONE_DIR/$file"; then
+    cp "$tmp/$file" "$CLONE_DIR/$file"
+    resynced+=("$file")
+  fi
+done
+
+# The shell reloads a plugin when its files change; nothing to restart.
+if ((${#resynced[@]})); then
+  omarchy-notification-send -g 󰅐 "glyphfield: idle service re-synced" \
+    "Picked up Omarchy's changes to ${resynced[*]}." >/dev/null 2>&1 || true
+fi

@@ -1,0 +1,35 @@
+#!/bin/bash
+#
+# Runs inside each screensaver terminal: glyphfield in the given style, with
+# Omarchy's exit rules. A keypress ends glyphfield; focus leaving the
+# screensaver window (the mouse, another window) ends it too. Either way every
+# screensaver window closes, on every monitor.
+
+style=${1:-kaleido}
+
+screensaver_in_focus() {
+  hyprctl activewindow -j | jq -e '.class == "org.omarchy.screensaver"' >/dev/null 2>&1
+}
+
+exit_screensaver() {
+  hyprctl eval 'hl.config({ cursor = { invisible = false } })' &>/dev/null || hyprctl keyword cursor:invisible false &>/dev/null || true
+  [[ -n $gf ]] && kill "$gf" 2>/dev/null && wait "$gf" 2>/dev/null
+  pkill -f '[o]rg.omarchy.screensaver' 2>/dev/null
+  exit 0
+}
+
+trap exit_screensaver SIGINT SIGTERM SIGHUP SIGQUIT
+
+printf '\033]11;rgb:00/00/00\007'
+hyprctl eval 'hl.config({ cursor = { invisible = true } })' &>/dev/null || hyprctl keyword cursor:invisible true &>/dev/null
+
+# glyphfield reads the keyboard itself (a background job's stdin would
+# otherwise be /dev/null) and exits on the first key.
+glyphfield --style "$style" </dev/tty &
+gf=$!
+
+while kill -0 "$gf" 2>/dev/null; do
+  screensaver_in_focus || exit_screensaver
+  sleep 0.5
+done
+exit_screensaver
