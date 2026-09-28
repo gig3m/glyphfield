@@ -28,6 +28,16 @@ hyprctl eval 'hl.config({ cursor = { invisible = true } })' &>/dev/null || hyprc
 glyphfield --style "$style" </dev/tty &
 gf=$!
 
+# While the launcher is still opening windows it moves focus from monitor to
+# monitor, so an early focus check sees another window focused and would close
+# them all. Wait for the launcher to finish (capped, in case it hangs), then
+# give focus a moment to settle.
+for _ in $(seq 40); do
+  pgrep -f '^[^ ]*bash [^ ]*/glyphfield-launch-screensaver' >/dev/null || break
+  sleep 0.25
+done
+sleep 1
+
 while kill -0 "$gf" 2>/dev/null; do
   screensaver_in_focus || exit_screensaver
   sleep 0.5
