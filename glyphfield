@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""glyphfield -- a full-screen field of glyphs painted by a morphing geometric pattern.
+
+Every cell holds a character. Two slow interference fields drive it: one picks
+the hue from a looping rainbow palette, the other picks the glyph's weight
+(`.` through `@`) and its brightness. Radial rings, a kaleidoscope fold and a
+rotating plane wave beat against each other, so rings, ovals and diamonds
+swell, merge and dissolve across the screen. The clock wobbles at irrational
+rates so the motion surges and never repeats; --steady gives an exact loop.
+
+Three styles: kaleido (swirling kaleidoscope), mirror (beads streaming out of
+a four-way mirror) and bloom (rings breathing from the centre).
+
+Settings come from ~/.config/glyphfield/config.toml, then command-line flags.
+--tune runs with a live settings overlay: adjust, watch, and save back to
+that file. Otherwise exits on any keypress. Ctrl-C also works.
+"""
+
+import argparse
+import math
+import os
+import random
+import select
+import signal
+import sys
+import termios
+import time
+import tomllib
+import tty
+
+# Light to heavy; the field's weight indexes into this.
+RAMP = "+*oS0%8&@"
+
+# Looping rainbow, as in the reference loop: gold, ember, rose, violet, azure,
+# cyan, leaf, back to gold.
+STOPS = ["#f7d83a", "#ff8a1f", "#ff3b5c", "#c63cff", "#3f7bff", "#22d3e6", "#58e05a"]
+
+# Bloom runs outward from a hot core: rose, ember, gold (held wide), leaf,
+# cyan, azure, violet, and wraps back to rose.
+BLOOM_STOPS = ["#ff2f6d", "#ff5a2a", "#ffb21f", "#f5e04a", "#f5e04a",
+               "#9be04a", "#2fd6d0", "#3a8bff", "#8a4bff"]
+
+NHUE = 56
+NLUM = len(RAMP)
+TAU = 2 * math.pi
+
+
+def parse_hex(s):
+    s = s.lstrip("#")
+    return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+
+
+def build_colors(hexes, floor=0.45, cyclic=True):
+    """SGR string per (hue, luminance) so the hot loop is a list index.
+
+    Cyclic palettes wrap from the last stop back to the first; ramps run
+    first to last and stop, so the hottest index is the last stop exactly."""
+    stops = [parse_hex(h) for h in hexes]
+    n = len(stops)
+    table = []
+    for h in range(NHUE):
+        p = h / NHUE * n if cyclic else h / (NHUE - 1) * (n - 1)
+        i = int(p)
+        t = p - i
+        a, b = stops[i % n], stops[(i + 1) % n]
+        # smooth the blend so bands read as bands, not a linear smear
+        t = t * t * (3 - 2 * t)
+        base = [a[k] + (b[k] - a[k]) * t for k in range(3)]
+        for l in range(NLUM):
+            g = floor + (1 - floor) * (l / (NLUM - 1))
+            table.append("\x1b[38;2;%d;%d;%dm" % tuple(int(c * g) for c in base))
+    return table
+
+
+def term_size():
+    try:
+        c = os.get_terminal_size()
+        return c.columns, c.lines
+    except OSError:
+        return 80, 24
+
+
+def wait_for_real_size(deadline=2.0):
+    """A pty starts at 80x24 until the compositor sizes the window."""
+    end = time.monotonic() + deadline
+    while time.monotonic() < end and term_size() == (80, 24):
+        time.sleep(0.02)
+
+
+class Field:
+    def __init__(self, cols, rows, aspect, folds, scale, pitch, opts=None):
+        self.cols, self.rows = cols, rows
+        # Normalise so the short side spans ~[-1, 1] in square units.
+        w, h = cols / aspect, rows
+        s = scale * 2.0 / min(w, h)
+        cells = []
+        for j in range(rows):
+            for i in range(0, cols, pitch):
+                x = ((i + 0.5) / aspect - w / 2) * s
+                y = ((j + 0.5) - h / 2) * s
+                r = math.hypot(x, y)
+                a = math.atan2(y, x)
+                # kaleidoscope: fold the angle into mirrored sectors
+                k = (a / TAU * folds) % 1.0
+                fa = abs(k - 0.5) * 2.0          # 0 at sector centre, 1 at seam
+                cells.append((j * cols + i, x, y, r, fa))
+        self.cells = cells
+
+    def frame(self, ph):
+        """ph: loop phase in [0, 1). Returns a list of (glyph index, colour index)."""
+        sin, cos = math.sin, math.cos
+        p = ph * TAU
+        # rotating plane wave direction, completes one turn per loop
+        dx, dy = cos(p), sin(p)
+        # centre of a drifting second ring system, on a Lissajous path
+        ox, oy = 0.55 * sin(p), 0.35 * sin(2 * p)
+        out = []
+        add = out.append
+        for pos, x, y, r, fa in self.cells:
+            r2 = math.hypot(x - ox, y - oy)
+            hue_v = (sin(r * 2.6 - p)
+                     + sin(r2 * 2.2 + 2 * p)
+                     + 0.7 * sin((x * dx + y * dy) * 2.0 + p)
+                     + 0.8 * cos(fa * 4.0 + r * 1.5 - 3 * p))
+            lum_v = (cos(r * 4.0 - 2 * p)
+                     + cos(r2 * 3.2 - p)
+                     + cos(fa * 5.0 - r * 2.0 + p))
+            hue = int(((hue_v * 0.16 + ph) % 1.0) * NHUE)
+            l = lum_v / 3.0 * 0.5 + 0.5                 # 0..1
+            l = l * l * (3 - 2 * l)                     # push to the extremes
+            li = int(l * (NLUM - 1) + 0.5)
+            add((pos, li, hue * NLUM + li))
+        return out
+
+
+class Bloom:
+    """Four-way mirrored rounded-rectangle rings that breathe out from the
+    centre, with per-cell colour and glyph jitter so it reads as a lit grid
+    rather than a smooth gradient."""
+
+    def __init__(self, cols, rows, aspect, folds, scale, pitch, opts=None):
+        rnd = random.Random(1)
+        cells = []
+        for j in range(rows):
+            for i in range(0, cols, pitch):
+                # screen-shaped coordinates: the rings follow the display's
+                # own proportions, so portrait and landscape both fill.
+                u = abs((i + 0.5) / cols * 2 - 1) * scale
+                v = abs((j + 0.5) / rows * 2 - 1) * scale
+                d = (u ** 3 + v ** 3) ** (1 / 3)        # rounded rectangle
+                a = math.atan2(v * rows, u * cols / aspect)
+                cells.append((j * cols + i, u, v, d, a,
+                              rnd.uniform(-1, 1),        # static hue jitter
+                              rnd.uniform(0, TAU),       # glyph twinkle phase
+                              rnd.randint(1, 3)))        # twinkle rate (loops)
+        self.cells = cells
+        self.folds = folds
+
+    def frame(self, ph):
+        sin, cos = math.sin, math.cos
+        p = ph * TAU
+        breathe = 0.12 * sin(p)
+        f = self.folds / 2
+        out = []
+        add = out.append
+        for pos, u, v, d, a, jit, tw, rate in self.cells:
+            # corners swirl: the angular wobble twists with distance and time
+            wob = 0.07 * cos(a * f * 2 + d * 5 - 2 * p) * d
+            ring = d + wob - breathe
+            # colour bands stream outward, two full cycles per loop
+            hue = int(((ring * 0.62 - 2 * ph + jit * 0.07) % 1.0) * NHUE)
+            # dark ripples: spiral bands that sweep out and blank the grid
+            dark = 0.5 + 0.5 * sin(ring * 9 - 4 * p + 1.4 * cos(a * f - p))
+            dark *= 0.6 + 0.4 * sin(ring * 3.5 - 2 * p + 2.0)
+            lum = dark * (1.25 - 0.35 * ring) + 0.12 * sin(tw + rate * p)
+            if lum < 0.16:
+                add((pos, -1, 0))          # blank cell
+                continue
+            li = int(min(1.0, lum) * (NLUM - 1) + 0.5)
+            add((pos, li, hue * NLUM + li))
+        return out
+
+# Mirror palette, measured off the reference loop: mostly white and cyan,
+# then blue, azure, yellow, teal; pink and red only as rare sparks.
+#          navy bg    blue       violet     teal       yellow     white      pink       red        cyan       azure
+MIRROR_COLORS = ["#2a2fc8", "#3d5bff", "#8a5cff", "#2fd6a8", "#f2e24a", "#f4f4f4", "#ff5fb0", "#ff4040",
+                 "#35d8f0", "#4a9cff"]
+BG, BLUE, VIOLET, TEAL, YELLOW, WHITE, PINK, RED, CYAN, AZURE = range(10)
+MIRROR_GLYPHS = "o8#G&@O%0+*."
+# primary glyph and shimmer alternates per colour
+MIRROR_SKIN = {
+    BLUE: ("o", "O0"), VIOLET: ("@", "o0"), TEAL: ("8", "8@&"), CYAN: ("8", "8@0"),
+    AZURE: ("0", "oO8"), YELLOW: ("#", "G8#"), WHITE: ("#", "G8@&"), PINK: ("&", "%G"),
+    RED: ("*", "+*"),
+}
+# bead colour weights, measured off the reference loop
+WEIGHT_KEYS = [("white", WHITE), ("cyan", CYAN), ("blue", BLUE), ("azure", AZURE),
+               ("yellow", YELLOW), ("teal", TEAL), ("violet", VIOLET), ("pink", PINK),
+               ("red", RED)]
+MIRROR_DEFAULTS = {
+    "beads": 22, "size_min": 0.04, "size_max": 0.075, "cells_min": 4, "cells_max": 14,
+    "symmetry": 0.5, "ring": 0.22, "birth": 0.4,
+    "w_white": 40, "w_cyan": 24, "w_blue": 9, "w_azure": 8, "w_yellow": 9,
+    "w_teal": 5, "w_violet": 3, "w_pink": 1, "w_red": 1,
+}
+
+
+def build_flat(hexes, floor):
+    """SGR per (colour, level): fixed colours, NLUM brightness steps each."""
+    table = []
+    for hx in hexes:
+        base = parse_hex(hx)
+        for l in range(NLUM):
+            g = floor + (1 - floor) * (l / (NLUM - 1))
+            table.append("\x1b[38;2;%d;%d;%dm" % tuple(int(c * g) for c in base))
+    return table
+
+
+class Mirror:
+    """Kaleidoscope, built the way a real one is: the mirrors reflect a pile of
+    beads. Each bead is a small cluster of identical glyphs in one colour,
+    laid out in a random pixel pattern on a GxG grid. Beads are born at the
+    centre, stream outward and swell toward the corners like an endless zoom,
+    and every bead is painted four ways (eight with --folds 8), so colour
+    comes in coherent patches that mix where beads meet.
+
+    Rings of beads advance in s = log(r + R0): scrolling s is the zoom, and
+    R0 gives the centre a real size so each ring is born as one overlapping,
+    symmetric motif. Beads are hashed per ring, so nothing repeats."""
+
+    GLYPHS = MIRROR_GLYPHS
+    NO_JITTER = True       # shimmer here swaps within a bead's own glyph set
+    RING = 0.22            # ring spacing in s
+    R0 = 0.4               # log offset: size of the birth motif
+    PER_RING = 22          # beads per ring across the quadrant
+    SIZE = (0.04, 0.075)   # bead half-width as a fraction of (r + R0)
+    G = 5                  # bead pattern grid
+
+    def __init__(self, cols, rows, aspect, folds, scale, pitch, opts=None):
+        o = dict(MIRROR_DEFAULTS, **(opts or {}))
+        self.PER_RING = max(1, int(o["beads"]))
+        self.SIZE = (o["size_min"], max(o["size_min"], o["size_max"]))
+        self.RING = o["ring"]
+        self.R0 = o["birth"]
+        lo, hi = int(o["cells_min"]), int(o["cells_max"])
+        self.ncells = (max(1, min(lo, hi)), min(self.G * self.G, max(lo, hi)))
+        self.sym = o["symmetry"]
+        self.deal = [c for name, c in WEIGHT_KEYS for _ in range(int(o["w_" + name]))] or [WHITE]
+        rnd = random.Random(3)
+        self.cols, self.rows, self.aspect, self.pitch = cols, rows, aspect, pitch
+        self.w, self.h = cols / aspect, rows
+        self.s = 1.0 / math.hypot(self.w / 2, self.h / 2)   # corners at r = 1
+        self.diag = folds >= 8
+        self.scale = scale
+        self.nx = len(range(0, cols, pitch))
+        self.bg = [(rnd.random(), rnd.uniform(0, TAU), rnd.randint(1, 3))
+                   for _ in range(self.nx * rows)]
+        self.birth = math.log(self.R0)
+        self.smax = math.log(1.0 + self.R0) + 0.1
+        self.cache = {}
+
+    def pattern(self, rnd):
+        """n cells grown as a random walk from the grid's centre, sometimes
+        made mirror-symmetric so it reads as a cut crystal."""
+        G = self.G
+        n = rnd.randint(*self.ncells)
+        cells = {(G // 2, G // 2)}
+        pool = list(cells)
+        while len(cells) < n:
+            x, y = rnd.choice(pool)
+            dx, dy = rnd.choice(((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1)))
+            x, y = x + dx, y + dy
+            if 0 <= x < G and 0 <= y < G and (x, y) not in cells:
+                cells.add((x, y))
+                pool.append((x, y))
+        if rnd.random() < self.sym:
+            cells |= {(G - 1 - x, y) for x, y in cells}
+        return frozenset(cells)
+
+    def ring(self, k):
+        """Beads of ring k: (s offset, angle, size, pattern, colour, pulse)."""
+        got = self.cache.get(k)
+        if got is None:
+            rnd = random.Random(k * 7919 + 17)
+            n = self.PER_RING
+            got = [(rnd.uniform(-0.5, 0.5) * self.RING,
+                    (i + rnd.random()) / n * (math.pi / 2),
+                    rnd.uniform(*self.SIZE),
+                    self.pattern(rnd),
+                    rnd.choice(self.deal),
+                    rnd.uniform(0, TAU))
+                   for i in range(n)]
+            self.cache[k] = got
+            if len(self.cache) > 64:
+                self.cache.pop(min(self.cache))
+        return got
+
+    def frame(self, ph):
+        sin, floor, exp = math.sin, math.floor, math.exp
+        p = ph * TAU
+        L = self.RING
+        flow = ph * 3 * L / self.scale             # three rings stream out per cycle
+        s, w, h, asp, pitch, nx, G = self.s, self.w, self.h, self.aspect, self.pitch, self.nx, self.G
+        paint = [None] * (nx * self.rows)
+        kmin = floor((self.birth - flow) / L) - 2
+        kmax = floor((self.smax - flow) / L) + 2
+        # inner rings first, so the bigger outer beads land on top
+        for k in range(kmin, kmax + 1):
+            for so, ang, size, pat, col, pp in self.ring(k):
+                sb = k * L + so + flow
+                if sb < self.birth or sb > self.smax:
+                    continue
+                rb = exp(sb) - self.R0
+                half = size * (rb + self.R0) * (1.0 + 0.08 * sin(p * 2 + pp))
+                bx, by = rb * math.cos(ang), rb * math.sin(ang)
+                imgs = [(bx, by, 1, 1, False), (-bx, by, -1, 1, False),
+                        (bx, -by, 1, -1, False), (-bx, -by, -1, -1, False)]
+                if self.diag:
+                    imgs += [(y, x, sy, sx, True) for x, y, sx, sy, _ in imgs]
+                H = half / s
+                for x, y, sx, sy, swap in imgs:
+                    X, Y = x / s + w / 2, y / s + h / 2
+                    j0, j1 = max(0, int(Y - H)), min(self.rows - 1, int(Y + H) + 1)
+                    i0 = max(0, int((X - H) * asp) // pitch)
+                    i1 = min(nx - 1, int((X + H) * asp) // pitch + 1)
+                    for j in range(j0, j1 + 1):
+                        dy = (j + 0.5 - Y) / H * sy
+                        if dy <= -1.0 or dy >= 1.0:
+                            continue
+                        row = j * nx
+                        for i in range(i0, i1 + 1):
+                            dx = ((i * pitch + 0.5) / asp - X) / H * sx
+                            if dx <= -1.0 or dx >= 1.0:
+                                continue
+                            gx, gy = int((dx + 1) * G / 2), int((dy + 1) * G / 2)
+                            if swap:
+                                gx, gy = gy, gx
+                            if (gx, gy) in pat:
+                                paint[row + i] = col
+        out = []
+        add = out.append
+        top = NLUM - 1
+        nlit = 0
+        cols = self.cols
+        for idx, col in enumerate(paint):
+            pos = (idx // nx) * cols + (idx % nx) * pitch
+            spark, tw, rate = self.bg[idx]
+            glow = 0.5 + 0.5 * sin(tw + rate * p)
+            if col is not None:
+                nlit += 1
+                prim, alts = MIRROR_SKIN[col]
+                ch = prim if spark > 0.2 * glow else alts[int(spark * 97) % len(alts)]
+                add((pos, MIRROR_GLYPHS.index(ch), col * NLUM + int((0.78 + 0.22 * glow) * top)))
+            elif spark > 0.3 + 0.3 * glow:
+                add((pos, -1, 0))
+            else:
+                add((pos, 0, BG * NLUM + int((0.08 + 0.18 * glow) * top)))
+        self.coverage = nlit / len(paint)
+        return out
+
+
+def render(cur, prev, cols, colors, glyphs=RAMP, mask=(0, 0)):
+    """Diff-draw the field. mask = (rows, cols) of a top-left panel the field
+    never paints under, so an overlay drawn there cannot flicker."""
+    buf = []
+    add = buf.append
+    last = -2
+    last_cid = -1
+    mrows, mcols = mask
+    for k, cell in enumerate(cur):
+        if prev is not None and prev[k] == cell:
+            continue
+        idx, gi, cid = cell
+        if mrows and idx // cols < mrows and idx % cols < mcols:
+            last = -2
+            continue
+        if idx != last + 1:
+            add("\x1b[%d;%dH" % (idx // cols + 1, idx % cols + 1))
+        if gi < 0:
+            add(" ")
+            last = idx
+            continue
+        if cid != last_cid:
+            add(colors[cid])
+            last_cid = cid
+        add(glyphs[gi])
+        last = idx
+    return "".join(buf)
+
+
+# --------------------------------------------------------------------------
+# settings
+# --------------------------------------------------------------------------
+
+STYLES = ("kaleido", "mirror", "bloom")
+CONFIG = os.path.expanduser("~/.config/glyphfield/config.toml")
+
+COMMON_DEFAULTS = {"period": 16.0, "jitter": 0.12, "steady": False, "scale": 1.0,
+                   "folds": 8, "pitch": 2, "fps": 30}
+STYLE_DEFAULTS = {
+    "kaleido": dict(COMMON_DEFAULTS),
+    "bloom": dict(COMMON_DEFAULTS),
+    "mirror": dict(COMMON_DEFAULTS, period=12.0, folds=4, **MIRROR_DEFAULTS),
+}
+
+# key, label, styles (None = all), lo, hi, step, format, rebuilds the field
+_M = ("mirror",)
+PARAMS = [
+    ("period", "period (s, lower = faster)", None, 2, 60, 0.5, "%.1f", False),
+    ("steady", "steady loop, no surges", None, 0, 1, 1, "bool", False),
+    ("jitter", "glyph shimmer", ("kaleido", "bloom"), 0, 0.6, 0.02, "%.2f", False),
+    ("scale", "zoom", None, 0.3, 3.0, 0.05, "%.2f", True),
+    ("folds", "mirror folds", ("kaleido", "bloom"), 2, 16, 1, "%d", True),
+    ("folds", "diagonal mirror (4 / 8)", _M, 4, 8, 4, "%d", True),
+    ("pitch", "columns per glyph", None, 1, 3, 1, "%d", True),
+    ("fps", "frame rate", None, 10, 60, 5, "%d", False),
+    ("beads", "beads per ring", _M, 2, 60, 1, "%d", True),
+    ("size_min", "bead size, min", _M, 0.01, 0.2, 0.005, "%.3f", True),
+    ("size_max", "bead size, max", _M, 0.01, 0.25, 0.005, "%.3f", True),
+    ("cells_min", "glyphs per bead, min", _M, 1, 25, 1, "%d", True),
+    ("cells_max", "glyphs per bead, max", _M, 1, 25, 1, "%d", True),
+    ("symmetry", "symmetric beads", _M, 0, 1, 0.05, "%.2f", True),
+    ("ring", "ring spacing", _M, 0.08, 0.6, 0.01, "%.2f", True),
+    ("birth", "centre motif size", _M, 0.1, 1.2, 0.05, "%.2f", True),
+] + [("w_" + name, "colour: " + name, _M, 0, 60, 1, "%d", True) for name, _ in WEIGHT_KEYS]
+
+
+def params_for(style):
+    return [p for p in PARAMS if p[2] is None or style in p[2]]
+
+
+def load_config():
+    try:
+        with open(CONFIG, "rb") as fh:
+            return tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def save_config(style, settings):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    lines = ["# glyphfield settings -- written by glyphfield --tune", 'style = "%s"' % style]
+    for st in STYLES:
+        lines.append("\n[%s]" % st)
+        for k, v in settings[st].items():
+            if isinstance(v, bool):
+                lines.append("%s = %s" % (k, "true" if v else "false"))
+            elif isinstance(v, float):
+                lines.append("%s = %s" % (k, repr(round(v, 4))))
+            else:
+                lines.append("%s = %d" % (k, v))
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(tmp, CONFIG)
+
+
+def make_field(style, cols, rows, aspect, st):
+    klass = {"kaleido": Field, "mirror": Mirror, "bloom": Bloom}[style]
+    opts = {k: st[k] for k in MIRROR_DEFAULTS} if style == "mirror" else None
+    return klass(cols, rows, aspect, int(st["folds"]), st["scale"], int(st["pitch"]), opts)
+
+
+def make_colors(style):
+    if style == "mirror":
+        return build_flat(MIRROR_COLORS, 0.25)
+    if style == "bloom":
+        return build_colors(BLOOM_STOPS, 0.6)
+    return build_colors(STOPS)
+
+
+# --------------------------------------------------------------------------
+# tuner overlay
+# --------------------------------------------------------------------------
+
+HUD_BG = "\x1b[48;2;12;12;24m"
+HUD_FG = "\x1b[38;2;200;200;215m"
+HUD_DIM = "\x1b[38;2;110;110;135m"
+HUD_HI = "\x1b[48;2;40;44;90m\x1b[38;2;255;255;255m"
+HUD_W = 56
+
+
+def slider(v, lo, hi, width=12):
+    t = 0.0 if hi == lo else (v - lo) / (hi - lo)
+    n = int(round(max(0.0, min(1.0, t)) * (width - 1)))
+    return "━" * n + "●" + "─" * (width - 1 - n)
+
+
+def draw_hud(style, st, sel, stats, flash):
+    """The overlay, as cursor moves and text. Each line is a list of
+    (colour, text) segments padded to HUD_W; returns (string, row count)."""
+    lines = []
+    tabs = "  ".join(("[%s]" % x) if x == style else (" %s " % x) for x in STYLES)
+    lines.append([(HUD_FG, " glyphfield tuner   " + tabs)])
+    lines.append([(HUD_DIM, " " + stats)])
+    lines.append([])
+    for i, (k, label, _, lo, hi, step, fmt, _) in enumerate(params_for(style)):
+        v = st[k]
+        if fmt == "bool":
+            val, bar = ("on" if v else "off"), ("[x]" if v else "[ ]").ljust(12)
+        else:
+            val, bar = fmt % v, slider(v, lo, hi)
+        base = HUD_HI if i == sel else HUD_FG
+        if k.startswith("w_"):
+            hx = MIRROR_COLORS[dict(WEIGHT_KEYS)[k[2:]]]
+            seg = [(base, " "), (base + "\x1b[38;2;%d;%d;%dm" % parse_hex(hx), "■"),
+                   (base, " %-24s %s %6s" % (k[2:], bar, val))]
+        else:
+            seg = [(base, " %-26s %s %6s" % (label, bar, val))]
+        lines.append(seg)
+    lines.append([])
+    lines.append([(HUD_DIM, " ↑↓ pick  ←→ adjust  [ ] ×5  tab style  space toggle")])
+    lines.append([(HUD_DIM, " r reset one  R reset style  s save  h hide  q quit")])
+    if flash:
+        lines.append([("\x1b[38;2;120;230;150m", " " + flash)])
+    buf = []
+    for row, segs in enumerate(lines):
+        buf.append("\x1b[%d;1H%s" % (row + 1, HUD_BG))
+        used = 0
+        for color, text in segs:
+            text = text[:HUD_W - used]
+            buf.append(HUD_BG + color + text)
+            used += len(text)
+        buf.append(HUD_BG + " " * (HUD_W - used))
+    buf.append("\x1b[0m")
+    return "".join(buf), len(lines)
+
+
+def read_keys(fd):
+    """Drain pending input into key names."""
+    data = os.read(fd, 256).decode("utf-8", "replace")
+    keys = []
+    i = 0
+    seqs = {"\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left",
+            "\x1bOA": "up", "\x1bOB": "down", "\x1bOC": "right", "\x1bOD": "left",
+            "\x1b[Z": "backtab"}
+    while i < len(data):
+        for seq, name in seqs.items():
+            if data.startswith(seq, i):
+                keys.append(name)
+                i += len(seq)
+                break
+        else:
+            ch = data[i]
+            keys.append({"\t": "tab", "\x1b": "esc", " ": "space", "\x03": "q"}.get(ch, ch))
+            i += 1
+    return keys
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="glyphfield",
+        description="Full-screen glyph grid driven by a looping geometric pattern. "
+                    "Defaults come from " + CONFIG + "; flags override it.")
+    ap.add_argument("--style", default=None, choices=STYLES,
+                    help="kaleido: swirling kaleidoscope; mirror: beads streaming out "
+                         "of a four-way mirror; bloom: rings breathing from the centre")
+    ap.add_argument("--tune", action="store_true",
+                    help="live settings overlay; keys adjust, s saves to the config")
+    ap.add_argument("--period", type=float, help="seconds per base cycle; lower is faster")
+    ap.add_argument("--jitter", type=float,
+                    help="fraction of cells that flicker to a neighbouring glyph each frame")
+    ap.add_argument("--steady", action="store_true", default=None,
+                    help="constant pace and an exact loop, no surges")
+    ap.add_argument("--fps", type=int, help="frame rate cap")
+    ap.add_argument("--folds", type=int, help="mirror sectors (mirror: 4, or 8 for the diagonal)")
+    ap.add_argument("--scale", type=float, help="zoom; >1 packs more pattern on screen")
+    ap.add_argument("--pitch", type=int, help="columns per glyph; 2 makes a square dot grid")
+    ap.add_argument("--aspect", type=float, default=2.22,
+                    help="cell height:width ratio (default: 2.22)")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    settings = {}
+    for stl in STYLES:
+        st = dict(STYLE_DEFAULTS[stl])
+        for k, v in (cfg.get(stl) or {}).items():
+            if k in st:
+                st[k] = type(st[k])(v) if not isinstance(st[k], bool) else bool(v)
+        settings[stl] = st
+    style = args.style or (cfg.get("style") if cfg.get("style") in STYLES else "kaleido")
+    for k in ("period", "jitter", "steady", "fps", "folds", "scale", "pitch"):
+        v = getattr(args, k)
+        if v is not None:
+            settings[style][k] = v
+
+    out = sys.stdout
+    fd = sys.stdin.fileno()
+    interactive = sys.stdin.isatty() and not os.environ.get("SCREENSAVER_MANAGED")
+    tune = args.tune and sys.stdin.isatty()
+    saved = None
+
+    resized = [False]
+    signal.signal(signal.SIGWINCH, lambda *_: resized.__setitem__(0, True))
+
+    def bail(*_):
+        raise SystemExit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(sig, bail)
+
+    try:
+        if interactive or tune:
+            saved = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+
+        out.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b]11;rgb:00/00/00\x07\x1b[2J")
+        out.flush()
+
+        wait_for_real_size()
+        cols, rows = term_size()
+        st = settings[style]
+        field = make_field(style, cols, rows, args.aspect, st)
+        colors = make_colors(style)
+        prev = None
+        start = time.monotonic()
+        rng = random.Random()
+        # tuner state
+        sel, hud, flash, flash_until = 0, True, "", 0.0
+        hud_rows = 0
+        fps_seen, frames, fps_t = 0.0, 0, time.monotonic()
+        rebuild = False
+
+        while True:
+            if (interactive or tune) and select.select([fd], [], [], 0)[0]:
+                if not tune:
+                    break
+                plist = params_for(style)
+                quit_ = False
+                for key in read_keys(fd):
+                    k, label, _, lo, hi, step, fmt, structural = plist[sel]
+                    if key in ("q", "esc"):
+                        quit_ = True
+                    elif key == "up":
+                        sel = (sel - 1) % len(plist)
+                    elif key == "down":
+                        sel = (sel + 1) % len(plist)
+                    elif key in ("left", "right", "[", "]", "space"):
+                        if fmt == "bool":
+                            st[k] = not st[k]
+                        else:
+                            d = step * (5 if key in "[]" else 1) * (-1 if key in ("left", "[") else 1)
+                            v = min(hi, max(lo, st[k] + d))
+                            st[k] = int(round(v)) if fmt == "%d" else round(v, 4)
+                        rebuild = rebuild or structural
+                    elif key in ("tab", "backtab") or key in ("1", "2", "3"):
+                        if key in ("1", "2", "3"):
+                            style = STYLES[int(key) - 1]
+                        else:
+                            style = STYLES[(STYLES.index(style) + (1 if key == "tab" else -1)) % 3]
+                        st = settings[style]
+                        colors = make_colors(style)
+                        sel = 0
+                        rebuild = True
+                    elif key == "r":
+                        st[k] = STYLE_DEFAULTS[style][k]
+                        rebuild = rebuild or structural
+                    elif key == "R":
+                        settings[style] = st = dict(STYLE_DEFAULTS[style])
+                        rebuild = True
+                    elif key == "h":
+                        hud = not hud
+                        prev = None
+                    elif key == "s":
+                        save_config(style, settings)
+                        flash, flash_until = "saved to " + CONFIG.replace(os.path.expanduser("~"), "~"), time.monotonic() + 3
+                if quit_:
+                    break
+            now = time.monotonic()
+            if resized[0] or rebuild:
+                if resized[0]:
+                    cols, rows = term_size()
+                resized[0] = rebuild = False
+                field = make_field(style, cols, rows, args.aspect, st)
+                prev = None
+                out.write("\x1b[0m\x1b[2J")
+
+            period = st["period"]
+            ph = (now - start) / period
+            if not st["steady"]:
+                # Irrational-rate wobble on the clock: motion surges and
+                # lulls, and the pattern never lands on the same frame twice.
+                # Amplitudes are sized from the rate, 1 + 0.3cos + 0.15cos,
+                # so pace swings 0.55x..1.45x and never stalls or reverses.
+                ph += (0.3 / (TAU * 0.618) * math.sin(ph * TAU * 0.618)
+                       + 0.15 / (TAU * 0.271) * math.sin(ph * TAU * 0.271 + 1.0))
+            cur = field.frame(ph % 1.0 if st["steady"] else ph)
+            jitter = st["jitter"]
+            if jitter > 0 and not getattr(field, "NO_JITTER", False):
+                for k in rng.sample(range(len(cur)), int(len(cur) * jitter)):
+                    pos, gi, cid = cur[k]
+                    if gi < 0:
+                        continue
+                    ng = min(NLUM - 1, max(0, gi + rng.choice((-2, -1, 1, 2))))
+                    cur[k] = (pos, ng, cid - gi + ng)
+            overlay, mask = "", (0, 0)
+            if tune and hud:
+                frames += 1
+                if now - fps_t >= 1.0:
+                    fps_seen, frames, fps_t = frames / (now - fps_t), 0, now
+                stats = "%.0f fps" % fps_seen
+                if hasattr(field, "coverage"):
+                    stats += "   coverage %.0f%%" % (100 * field.coverage)
+                if flash and now > flash_until:
+                    flash = ""
+                    prev = None
+                overlay, n = draw_hud(style, st, sel, stats, flash)
+                if n < hud_rows:
+                    prev = None            # overlay shrank: repaint what it uncovered
+                hud_rows = n
+                mask = (n, HUD_W)
+            chunk = render(cur, prev, cols, colors, getattr(field, "GLYPHS", RAMP), mask) + overlay
+            if chunk:
+                out.write(chunk)
+                out.flush()
+            prev = cur
+
+            slack = 1.0 / max(1, st["fps"]) - (time.monotonic() - now)
+            if slack > 0:
+                time.sleep(slack)
+
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        if saved is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        out.write("\x1b[?7h\x1b[0m\x1b[?25h\x1b[?1049l")
+        out.flush()
+
+
+if __name__ == "__main__":
+    main()
