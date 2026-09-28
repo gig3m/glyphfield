@@ -1,65 +1,51 @@
 #!/bin/bash
 #
-# Keep glyphfield's clone of the Omarchy idle service in sync with the
-# packaged one.
+# After each Omarchy update, keep glyphfield's screensaver hookup current.
 #
-# The clone (<user>.idle) exists only to swap one command: the idle service
-# hardcodes omarchy-launch-screensaver in Service.qml, shell.json has no
-# setting for it, and /usr/share/omarchy/bin outranks ~/.local/bin on PATH, so
-# cloning the plugin is the only supported way to launch something else.
+# - If Omarchy's idle service now reads idle.screensaverCommand
+#   (omacom/omarchy#10483), switch to that: set the key, hand idle duty back to
+#   the stock service, and park the old clone. Nothing to maintain after that.
+# - Otherwise re-copy the packaged idle service over glyphfield's <user>.idle
+#   clone and re-apply the launcher swap, so the clone keeps upstream fixes and
+#   only ever differs from stock by that one command.
 #
-# A clone stops receiving upstream fixes. After every Omarchy update this
-# re-copies the packaged plugin and re-applies the swap, so the clone can only
-# ever differ from stock by that one command. manifest.json is left alone:
-# it carries the clone's own id.
+# Installed as a symlink into ~/.config/omarchy/hooks/post-update.d/.
 
 set -euo pipefail
 
-STOCK_DIR="/usr/share/omarchy/shell/plugins/services/idle"
-STOCK_CMD="omarchy-launch-screensaver"
-CUSTOM_CMD="glyphfield-launch-screensaver"
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+# shellcheck source=../../lib/omarchy.sh
+source "$REPO_DIR/lib/omarchy.sh"
 
-# The clone is named after whoever cloned it, so find it by its origin.
-CLONE_DIR=""
-for candidate in "$HOME"/.config/omarchy/plugins/*.idle; do
-  [[ -f $candidate/manifest.json ]] || continue
-  if grep -q '"clonedFrom": *"omarchy.idle"' "$candidate/manifest.json"; then
-    CLONE_DIR="$candidate"
-    break
-  fi
-done
-[[ -n $CLONE_DIR && -d $STOCK_DIR ]] || exit 0
+notify() { omarchy-notification-send "$@" >/dev/null 2>&1 || true; }
 
-# Only manage a clone that glyphfield set up.
-grep -q "$CUSTOM_CMD" "$CLONE_DIR/Service.qml" 2>/dev/null || exit 0
+clone=$(our_clone)
+[[ -n $clone && -d $STOCK_IDLE ]] || exit 0
 
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-resynced=()
+if supports_screensaver_command; then
+  set_screensaver_command || {
+    notify -u critical -g 󰅚 "glyphfield screensaver needs attention" \
+      "Could not set idle.screensaverCommand in shell.json; re-run glyphfield's install.sh."
+    exit 0
+  }
+  retire_clone >/dev/null
+  restart_shell || true
+  notify -g 󰅐 "glyphfield: switched to idle.screensaverCommand" \
+    "Omarchy can now launch glyphfield directly; the $(basename "$clone") clone is parked."
+  exit 0
+fi
 
-for src in "$STOCK_DIR"/*; do
-  file=$(basename "$src")
-  [[ -f $src && $file != manifest.json ]] || continue
-  if [[ $file == Service.qml ]]; then
-    sed "s/\b${STOCK_CMD}\b/${CUSTOM_CMD}/g" "$src" >"$tmp/$file"
-    # Never install a copy that no longer calls our launcher: if upstream
-    # changes how it starts the screensaver, say so instead.
-    if ! grep -q "$CUSTOM_CMD" "$tmp/$file"; then
-      omarchy-notification-send -u critical -g 󰅚 "glyphfield screensaver needs attention" \
-        "Omarchy's idle service changed shape; re-run glyphfield's install.sh." >/dev/null 2>&1 || true
-      exit 0
-    fi
-  else
-    cp "$src" "$tmp/$file"
-  fi
-  if ! cmp -s "$tmp/$file" "$CLONE_DIR/$file"; then
-    cp "$tmp/$file" "$CLONE_DIR/$file"
-    resynced+=("$file")
-  fi
-done
+if ! sync_clone "$clone"; then
+  # Never install a copy that no longer calls our launcher: if upstream changes
+  # how it starts the screensaver, say so instead.
+  notify -u critical -g 󰅚 "glyphfield screensaver needs attention" \
+    "Omarchy's idle service changed shape; re-run glyphfield's install.sh."
+  exit 0
+fi
 
-# The shell reloads a plugin when its files change; nothing to restart.
-if ((${#resynced[@]})); then
-  omarchy-notification-send -g 󰅐 "glyphfield: idle service re-synced" \
-    "Picked up Omarchy's changes to ${resynced[*]}." >/dev/null 2>&1 || true
+# A changed keepLoaded service only takes effect on a shell restart.
+if ((${#SYNCED[@]})); then
+  restart_shell || true
+  notify -g 󰅐 "glyphfield: idle service re-synced" \
+    "Picked up Omarchy's changes to ${SYNCED[*]}."
 fi

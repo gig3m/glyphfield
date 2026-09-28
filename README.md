@@ -75,28 +75,36 @@ place. `./uninstall.sh` puts everything back.
 
 ### How the Omarchy screensaver hookup works
 
-Omarchy's idle service hardcodes `omarchy-launch-screensaver`. `shell.json` has
-no setting for it, and `/usr/share/omarchy/bin` comes before `~/.local/bin` on
-the path, so replacing that script in `~/.local/bin` has no effect. The
-installer therefore follows the pattern of
-[omarchy-matrix-screensaver](https://github.com/etyurkin/omarchy-matrix-screensaver):
+The installer uses whichever mechanism your Omarchy supports:
 
-- Uses `omarchy plugin clone omarchy.idle` to clone the idle service into your
-  own `<user>.idle` plugin, swaps that one command for
-  `glyphfield-launch-screensaver`, and enables the clone in place of the stock
-  service. The idle service stays loaded across plugin reloads, so the
-  installer restarts the Omarchy shell (`omarchy-restart-shell`) for the switch
-  to take effect.
+- **`idle.screensaverCommand`**: if Omarchy's idle service reads this
+  `shell.json` key (proposed upstream in
+  [omacom/omarchy#10483](https://github.com/omacom/omarchy/pull/10483)), the
+  installer just sets it to `glyphfield-launch-screensaver`. That's one config
+  line with nothing cloned.
+- **Idle-service clone**: older Omarchy hardcodes `omarchy-launch-screensaver`
+  in the idle service. `/usr/share/omarchy/bin` also comes before
+  `~/.local/bin` on the path, so replacing that script has no effect. The
+  installer therefore follows
+  [omarchy-matrix-screensaver](https://github.com/etyurkin/omarchy-matrix-screensaver):
+  it runs `omarchy plugin clone omarchy.idle`, swaps that one command in your
+  `<user>.idle` clone, and enables the clone in place of the stock service.
+
+In both cases the installer:
+
+- Restarts the Omarchy shell (`omarchy-restart-shell`) so the switch takes
+  effect. The idle service stays loaded across plugin reloads, and changing
+  `idle.*` settings stops its monitor until a restart.
 - Installs `glyphfield-launch-screensaver`, which opens one terminal per monitor
   like Omarchy's launcher. It uses the same `org.omarchy.screensaver` window
   class, so the idle service still tracks the screensaver.
 - Installs `glyphfield-screensaver`, which runs glyphfield with Omarchy's exit
   rules: any key, or focus leaving the window, closes the screensaver on every
   monitor.
-- Adds a post-update hook that re-copies Omarchy's idle service after each
-  update and re-applies the swap. Your clone keeps getting upstream fixes, and
-  if Omarchy ever changes how the screensaver starts, you get a notification
-  instead of the screensaver silently not appearing.
+- Adds a post-update hook. While you're on the clone, it re-copies Omarchy's
+  idle service after each update and re-applies the swap, and it notifies you
+  if Omarchy changes how the screensaver starts. Once an update adds
+  `idle.screensaverCommand`, the hook switches you to it and parks the clone.
 
 The screensaver style lives in `~/.config/glyphfield/screensaver`. Its look is
 whatever you last saved from `glyphfield --tune`. Empty that file to go back

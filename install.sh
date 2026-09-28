@@ -16,10 +16,6 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 CONF_DIR="$HOME/.config/glyphfield"
 HOOK_DIR="$HOME/.config/omarchy/hooks/post-update.d"
-PLUGIN_DIR="$HOME/.config/omarchy/plugins"
-STOCK_IDLE="/usr/share/omarchy/shell/plugins/services/idle"
-STOCK_CMD="omarchy-launch-screensaver"
-CUSTOM_CMD="glyphfield-launch-screensaver"
 
 say() { printf '  %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -62,55 +58,46 @@ if ((!screensaver)); then
 fi
 
 command -v omarchy >/dev/null || die "not an Omarchy system; rerun with --no-screensaver"
+command -v jq >/dev/null || die "jq is missing"
+# shellcheck source=lib/omarchy.sh
+source "$REPO_DIR/lib/omarchy.sh"
 [[ -f $STOCK_IDLE/Service.qml ]] || die "Omarchy's idle service is not at $STOCK_IDLE"
 
 echo "Pointing Omarchy's idle service at glyphfield..."
-# Omarchy hardcodes the screensaver launcher in the idle plugin, shell.json has
-# no setting for it, and /usr/share/omarchy/bin outranks ~/.local/bin on PATH,
-# so cloning the plugin is the only supported way to launch something else.
-find_clone() {
-  local c
-  for c in "$PLUGIN_DIR"/*.idle; do
-    [[ -f $c/manifest.json ]] || continue
-    grep -q '"clonedFrom": *"omarchy.idle"' "$c/manifest.json" && { echo "$c"; return; }
-  done
-}
-clone=$(find_clone)
-if [[ -n $clone ]]; then
-  # A clone that launches something other than stock or us belongs to someone
-  # else (another screensaver project, or your own edits): leave it alone.
-  if ! grep -q "$CUSTOM_CMD" "$clone/Service.qml" &&
-    ! grep -q "\b$STOCK_CMD\b" "$clone/Service.qml"; then
-    die "$(basename "$clone") already launches a different screensaver; not touching it"
+if supports_screensaver_command; then
+  # This Omarchy reads idle.screensaverCommand: one config line, nothing cloned.
+  set_screensaver_command || die "could not update $SHELL_JSON"
+  say "set idle.screensaverCommand in $SHELL_JSON"
+  if retired=$(retire_clone) && [[ -n $retired ]]; then
+    say "retired the old clone $(basename "$retired"); omarchy.idle is back in charge"
   fi
-  say "reusing $(basename "$clone")"
 else
-  omarchy plugin clone omarchy.idle >/dev/null
+  # Older Omarchy hardcodes the launcher in the idle plugin, and
+  # /usr/share/omarchy/bin outranks ~/.local/bin on PATH, so clone the plugin
+  # and swap that one command.
   clone=$(find_clone)
-  [[ -n $clone ]] || die "could not clone omarchy.idle"
-  say "cloned omarchy.idle to $(basename "$clone")"
+  if [[ -n $clone ]]; then
+    # A clone that launches something other than stock or us belongs to
+    # someone else (another screensaver project, or your own edits).
+    if ! grep -q "$CUSTOM_CMD" "$clone/Service.qml" &&
+      ! grep -q "\b$STOCK_CMD\b" "$clone/Service.qml"; then
+      die "$(basename "$clone") already launches a different screensaver; not touching it"
+    fi
+    say "reusing $(basename "$clone")"
+  else
+    omarchy plugin clone omarchy.idle >/dev/null
+    clone=$(find_clone)
+    [[ -n $clone ]] || die "could not clone omarchy.idle"
+    say "cloned omarchy.idle to $(basename "$clone")"
+  fi
+  sync_clone "$clone" || die "Omarchy's idle service changed shape; the launcher swap needs updating"
+  omarchy plugin enable "$(basename "$clone")" >/dev/null 2>&1 || true
+  omarchy plugin disable omarchy.idle >/dev/null 2>&1 || true
+  say "$(basename "$clone") now launches $CUSTOM_CMD"
 fi
 
-# Copy the packaged plugin over the clone (manifest aside) and swap the one
-# command, exactly as the post-update hook will after each update.
-for src in "$STOCK_IDLE"/*; do
-  file=$(basename "$src")
-  [[ -f $src && $file != manifest.json ]] || continue
-  if [[ $file == Service.qml ]]; then
-    sed "s/\b${STOCK_CMD}\b/${CUSTOM_CMD}/g" "$src" >"$clone/$file"
-  else
-    cp "$src" "$clone/$file"
-  fi
-done
-grep -q "$CUSTOM_CMD" "$clone/Service.qml" ||
-  die "Omarchy's idle service changed shape; the launcher swap needs updating"
-omarchy plugin enable "$(basename "$clone")" >/dev/null 2>&1 || true
-omarchy plugin disable omarchy.idle >/dev/null 2>&1 || true
-say "$(basename "$clone") now launches $CUSTOM_CMD"
-# The idle service is keepLoaded: a running shell keeps the old instance until
-# it restarts, so without this the stock screensaver keeps coming up.
-if omarchy-restart-shell >/dev/null 2>&1; then
-  say "restarted the Omarchy shell so the clone takes over"
+if restart_shell; then
+  say "restarted the Omarchy shell so the change takes effect"
 else
   say "note: run omarchy-restart-shell (or log out and in) to finish the switch"
 fi
