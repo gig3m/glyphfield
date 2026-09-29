@@ -8,6 +8,10 @@ It's a single Python file with no dependencies, and needs Python 3.11 or newer.
 
 ## Styles
 
+| kaleido | mirror | bloom |
+|---|---|---|
+| ![kaleido style](docs/kaleido.gif) | ![mirror style](docs/mirror.gif) | ![bloom style](docs/bloom.gif) |
+
 - **kaleido**: a swirling kaleidoscope. Colored bands and glyph weights come
   from interference patterns folded into mirrored sectors.
 - **mirror**: works like a real kaleidoscope. Small "beads", each a cluster of
